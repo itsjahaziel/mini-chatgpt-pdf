@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#10B981"            # emerald (subtle accent)
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC" # soft card bg
+textColor = "#0F172A"                # slate-900
+font = "sans serif"

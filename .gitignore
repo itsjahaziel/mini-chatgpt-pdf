@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+data/uploads/
+data/processed/chroma/
+.DS_Store
+.streamlit/
