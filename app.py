@@ -1,6 +1,4 @@
 import os
-import re
-import hashlib
 from pathlib import Path
 from typing import Dict, List
 
@@ -11,14 +9,16 @@ from utils.pdf_loader import extract_text_from_pdf
 from utils.chunker import chunk_text
 from utils.embedder import get_or_create_collection, add_chunks
 from utils.llm import answer_with_context
+from utils.files import hashed_name, sniff_mime, too_big, ALLOWED_MIME
 
 # ---------- env / page ----------
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")
+load_dotenv(ROOT / ".env")  # loads OPENAI_API_KEY and MAX_FILE_MB if present
+
 st.set_page_config(page_title="Mini ChatGPT for PDFs", page_icon="📄", layout="wide")
 st.title("📄 Mini ChatGPT for PDFs")
 
-# ---------- simple styles (neutral, structured) ----------
+# ---------- simple styles ----------
 st.markdown(
     """
     <style>
@@ -33,45 +33,34 @@ st.markdown(
 
 # ---------- state ----------
 if "texts" not in st.session_state:
-    st.session_state["texts"]: Dict[str, str] = {}   # filename -> extracted text
+    st.session_state["texts"]: Dict[str, str] = {}          # filename -> extracted text
 if "indexed_sources" not in st.session_state:
-    st.session_state["indexed_sources"]: List[str] = []  # track which filenames have embeddings
+    st.session_state["indexed_sources"]: List[str] = []     # which filenames have embeddings
 
 # ---------- helpers ----------
-def sanitize_filename(name: str) -> str:
-    base, ext = os.path.splitext(name)
-    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")
-    return f"{base}{ext or '.pdf'}"
-
-def hashed_name(original_name: str, data: bytes) -> str:
-    stem = Path(sanitize_filename(original_name)).stem
-    digest = hashlib.sha256(data).hexdigest()[:12]
-    return f"{stem}__{digest}.pdf"
-
 def list_indexed_sources(collection) -> List[str]:
     """Return unique 'source' values stored in Chroma metadatas (paginated & robust)."""
     sources = set()
     try:
-        offset = 0
-        page = 1000
+        offset, page = 0, 1000
         while True:
             batch = collection.get(include=["metadatas"], limit=page, offset=offset)
             metadatas = batch.get("metadatas") or []
             if not metadatas:
                 break
 
-            # Chroma returns metadatas either as a list[dict] or list[list[dict]]
+            # Normalize to list[dict]
+            items = []
             if len(metadatas) and isinstance(metadatas[0], dict):
-                for md in metadatas:
-                    s = md.get("source")
-                    if s:
-                        sources.add(s)
+                items = metadatas
             else:
                 for rowlist in metadatas:
-                    for row in (rowlist or []):
-                        s = (row or {}).get("source")
-                        if s:
-                            sources.add(s)
+                    items.extend(rowlist or [])
+
+            for md in items:
+                s = (md or {}).get("source")
+                if s:
+                    sources.add(s)
 
             ids = batch.get("ids") or []
             if len(ids) < page:
@@ -85,15 +74,13 @@ def get_index_stats(collection) -> List[dict]:
     """Return [{'source': name, 'chunks': count}, ...] with pagination."""
     counts: Dict[str, int] = {}
     try:
-        offset = 0
-        page = 1000
+        offset, page = 0, 1000
         while True:
             batch = collection.get(include=["metadatas"], limit=page, offset=offset)
             metadatas = batch.get("metadatas") or []
             if not metadatas:
                 break
 
-            # Normalize to a flat iterator of dicts
             items = []
             if len(metadatas) and isinstance(metadatas[0], dict):
                 items = metadatas
@@ -159,50 +146,61 @@ if st.sidebar.button("🧹 Reset ALL embeddings"):
     except FileNotFoundError:
         st.sidebar.info("No index on disk.")
 
-# ---------- layout: two clear columns ----------
+# ---------- layout ----------
 col_ingest, col_index = st.columns([2, 1], gap="large")
 
 # ==============================
-# 1) INGEST (multi-PDF upload, de-dup by content hash)
+# 1) INGEST (safe upload: file-size + MIME; de-dup by content hash)
 # ==============================
 with col_ingest:
     st.subheader("1) Upload & Extract")
-    with st.container():
-        uploaded_files = st.file_uploader(
-            "Upload one or more PDFs (text-based, not scans)",
-            type=["pdf"],
-            accept_multiple_files=True,
-        )
-        if uploaded_files:
-            uploads_dir = ROOT / "data" / "uploads"
-            uploads_dir.mkdir(parents=True, exist_ok=True)
 
-            for uf in uploaded_files:
-                data = uf.getvalue()  # bytes of the uploaded file
-                final_name = hashed_name(uf.name, data)  # deterministic, content-based
-                final_path = uploads_dir / final_name
+    MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "5"))
+    st.caption(f"Max file size: {MAX_FILE_MB} MB • Allowed types: {', '.join(sorted(ALLOWED_MIME))}")
 
-                # If this content was already uploaded, skip saving (and skip re-extracting if we have it in memory)
-                if final_name in st.session_state["texts"]:
-                    st.info(f"Duplicate upload skipped (already extracted): {final_name}")
-                    continue
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDFs (text-based, not scans)",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
 
-                if not final_path.exists():
-                    with open(final_path, "wb") as f:
-                        f.write(data)
-                    saved = True
+    if uploaded_files:
+        uploads_dir = ROOT / "data" / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+
+        for uf in uploaded_files:
+            data = uf.getvalue()
+
+            # size check
+            if too_big(len(data), MAX_FILE_MB):
+                st.warning(f"Skipped **{uf.name}**: over {MAX_FILE_MB} MB.")
+                continue
+
+            # MIME check
+            mime = sniff_mime(data)
+            if mime not in ALLOWED_MIME:
+                st.warning(f"Skipped **{uf.name}**: unsupported type `{mime}`.")
+                continue
+
+            final_name = hashed_name(uf.name, data, suffix=".pdf")
+            final_path = uploads_dir / final_name
+
+            if final_name in st.session_state["texts"]:
+                st.info(f"Duplicate upload skipped (already extracted): {final_name}")
+                continue
+
+            if not final_path.exists():
+                final_path.write_bytes(data)
+
+            try:
+                text = extract_text_from_pdf(str(final_path))
+                if text and text.strip():
+                    st.session_state["texts"][final_name] = text
+                    st.success(f"Saved & Extracted: {final_name}")
                 else:
-                    saved = False  # already on disk from a previous run
-
-                try:
-                    text = extract_text_from_pdf(str(final_path))
-                    if text and text.strip():
-                        st.session_state["texts"][final_name] = text
-                        st.success(f"{'Saved & ' if saved else ''}Extracted: {final_name}")
-                    else:
-                        st.warning(f"No text found in: {final_name} (likely a scanned PDF)")
-                except Exception as e:
-                    st.error(f"Failed to extract {final_name}: {e}")
+                    st.warning(f"No text found in: {final_name} (likely a scanned PDF)")
+            except Exception as e:
+                st.error(f"Failed to extract {final_name}: {e}")
 
     # previews
     if st.session_state["texts"]:
@@ -212,7 +210,7 @@ with col_ingest:
                 st.text(txt[:2000] + ("..." if len(txt) > 2000 else ""))
 
 # ==============================
-# 2) INDEX (build & manage; multi-select; per-file delete; rebuild-all; table)
+# 2) INDEX (build & manage; multi-select; per-file delete; rebuild-all; stats)
 # ==============================
 with col_index:
     st.subheader("2) Build / Manage Index")
@@ -248,7 +246,7 @@ with col_index:
                 if total:
                     st.success(f"Rebuilt/updated {total} chunks across {len(extracted_names)} file(s).")
 
-    # per-source delete
+    # per-source delete + stats
     indexed_sources = list_indexed_sources(collection)
     if indexed_sources:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -263,7 +261,6 @@ with col_index:
             except Exception as e:
                 st.error(f"Delete failed: {e}")
 
-        # stats table
         stats = get_index_stats(collection)
         if stats:
             st.markdown("**Index summary**")
@@ -278,7 +275,6 @@ with col_index:
 st.markdown("---")
 st.subheader("3) Ask Questions (grounded in your PDFs)")
 
-# filter by source(s)
 indexed_sources = list_indexed_sources(collection)
 if indexed_sources:
     source_filter = st.multiselect(
@@ -298,7 +294,7 @@ if go:
     elif not api_key:
         st.error("Set OPENAI_API_KEY in .env.")
     else:
-        # query with optional metadata filter
+        # metadata filter
         where = None
         if source_filter and len(source_filter) != len(indexed_sources):
             where = {"source": {"$in": source_filter}}
