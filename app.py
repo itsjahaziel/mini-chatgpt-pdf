@@ -1,19 +1,19 @@
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Any
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from utils.pdf_loader import extract_text_from_pdf
+from utils.pdf_loader import extract_text_from_pdf, get_pdf_info
 from utils.chunker import chunk_text
 from utils.embedder import get_or_create_collection, add_chunks
 from utils.llm import answer_with_context
-from utils.files import hashed_name, sniff_mime, too_big, ALLOWED_MIME
+from utils.files import hashed_name, sniff_mime, too_big, ALLOWED_MIME, human_bytes
 
 # ---------- env / page ----------
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")  # loads OPENAI_API_KEY and MAX_FILE_MB if present
+load_dotenv(ROOT / ".env")  # loads OPENAI_API_KEY, MAX_FILE_MB, MAX_PAGES
 
 st.set_page_config(page_title="Mini ChatGPT for PDFs", page_icon="📄", layout="wide")
 st.title("📄 Mini ChatGPT for PDFs")
@@ -23,9 +23,12 @@ st.markdown(
     """
     <style>
       .card { background:#fff; border:1px solid #E5E7EB; border-radius:12px; padding:16px; }
-      .muted { color:#6B7280; }
-      .tight { margin-top: .25rem; }
-      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#ECFDF5; color:#065F46; font-weight:600; font-size:12px; }
+      .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-weight:600; font-size:12px; margin-right:6px; }
+      .pill-ok { background:#ECFDF5; color:#065F46; border:1px solid #A7F3D0; }
+      .pill-warn { background:#FEF3C7; color:#92400E; border:1px solid #FCD34D; }
+      .pill-info { background:#EFF6FF; color:#1E40AF; border:1px solid #BFDBFE; }
+      .file-header { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+      .file-name { font-weight:700; color:#0F172A; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -36,6 +39,9 @@ if "texts" not in st.session_state:
     st.session_state["texts"]: Dict[str, str] = {}          # filename -> extracted text
 if "indexed_sources" not in st.session_state:
     st.session_state["indexed_sources"]: List[str] = []     # which filenames have embeddings
+if "file_meta" not in st.session_state:
+    # filename -> {'bytes': int, 'mime': str, 'pages_total': int, 'pages_used': int, 'title': Optional[str]}
+    st.session_state["file_meta"]: Dict[str, Dict[str, Any]] = {}
 
 # ---------- helpers ----------
 def list_indexed_sources(collection) -> List[str]:
@@ -49,7 +55,6 @@ def list_indexed_sources(collection) -> List[str]:
             if not metadatas:
                 break
 
-            # Normalize to list[dict]
             items = []
             if len(metadatas) and isinstance(metadatas[0], dict):
                 items = metadatas
@@ -69,6 +74,7 @@ def list_indexed_sources(collection) -> List[str]:
     except Exception:
         pass
     return sorted(sources)
+
 
 def get_index_stats(collection) -> List[dict]:
     """Return [{'source': name, 'chunks': count}, ...] with pagination."""
@@ -103,6 +109,7 @@ def get_index_stats(collection) -> List[dict]:
     rows = [{"source": s, "chunks": n} for s, n in sorted(counts.items(), key=lambda x: x[0].lower())]
     return rows
 
+
 def index_files(collection, filenames: List[str], tokens_per_chunk: int, overlap: int) -> int:
     """Index (or re-index) the given filenames using stable IDs; returns total chunks indexed."""
     total = 0
@@ -121,6 +128,7 @@ def index_files(collection, filenames: List[str], tokens_per_chunk: int, overlap
         except Exception as e:
             st.error(f"{fname}: indexing failed → {e}")
     return total
+
 
 # ---------- sidebar: knobs & index maintenance ----------
 st.sidebar.header("Settings")
@@ -150,13 +158,17 @@ if st.sidebar.button("🧹 Reset ALL embeddings"):
 col_ingest, col_index = st.columns([2, 1], gap="large")
 
 # ==============================
-# 1) INGEST (safe upload: file-size + MIME; de-dup by content hash)
+# 1) INGEST (safe upload + page-limit guard)
 # ==============================
 with col_ingest:
     st.subheader("1) Upload & Extract")
 
     MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "5"))
-    st.caption(f"Max file size: {MAX_FILE_MB} MB • Allowed types: {', '.join(sorted(ALLOWED_MIME))}")
+    MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
+    st.caption(
+        f"Max file size: {MAX_FILE_MB} MB • Max pages read: {MAX_PAGES} • "
+        f"Allowed types: {', '.join(sorted(ALLOWED_MIME))}"
+    )
 
     uploaded_files = st.file_uploader(
         "Upload one or more PDFs (text-based, not scans)",
@@ -193,24 +205,71 @@ with col_ingest:
                 final_path.write_bytes(data)
 
             try:
-                text = extract_text_from_pdf(str(final_path))
+                pages_total, title = get_pdf_info(str(final_path))
+            except Exception as e:
+                st.error(f"Failed to read metadata for {final_name}: {e}")
+                pages_total, title = 0, None
+
+            try:
+                # Page-limit guard: only read the first MAX_PAGES pages
+                text = extract_text_from_pdf(str(final_path), max_pages=MAX_PAGES)
                 if text and text.strip():
                     st.session_state["texts"][final_name] = text
-                    st.success(f"Saved & Extracted: {final_name}")
+                    st.session_state["file_meta"][final_name] = {
+                        "bytes": len(data),
+                        "mime": mime,
+                        "pages_total": pages_total,
+                        "pages_used": min(pages_total, MAX_PAGES),
+                        "title": title,
+                    }
+                    truncated = pages_total > MAX_PAGES
+                    msg = "Saved & Extracted"
+                    if truncated:
+                        msg += f" (truncated to first {MAX_PAGES} pages)"
+                    st.success(f"{msg}: {final_name}")
                 else:
                     st.warning(f"No text found in: {final_name} (likely a scanned PDF)")
             except Exception as e:
                 st.error(f"Failed to extract {final_name}: {e}")
 
-    # previews
+    # previews + meta badges
     if st.session_state["texts"]:
         st.markdown("**Extracted files**")
-        for fname, txt in sorted(st.session_state["texts"].items()):
-            with st.expander(f"{fname} — preview", expanded=False):
+        for fname in sorted(st.session_state["texts"].keys()):
+            meta = st.session_state["file_meta"].get(fname, {})
+            size_pill = f'<span class="pill pill-info">{human_bytes(meta.get("bytes", 0))}</span>' if meta else ""
+            mime_pill = f'<span class="pill pill-info">{meta.get("mime","?")}</span>' if meta else ""
+            pages_used = meta.get("pages_used")
+            pages_total = meta.get("pages_total")
+            if pages_used and pages_total:
+                pages_label = f"{pages_used}/{pages_total} pages" if pages_total >= pages_used else f"{pages_used} pages"
+            elif pages_total:
+                pages_label = f"{pages_total} pages"
+            else:
+                pages_label = "pages: ?"
+
+            truncated = (pages_total or 0) > pages_used if (pages_total and pages_used) else False
+            pages_pill = (
+                f'<span class="pill {"pill-warn" if truncated else "pill-ok"}">{pages_label}'
+                f'{" • truncated" if truncated else ""}</span>'
+            )
+
+            title = meta.get("title")
+            title_pill = f'<span class="pill pill-ok">title: {title}</span>' if title else ""
+
+            header_html = (
+                f'<div class="file-header">'
+                f'<span class="file-name">{fname}</span>'
+                f'{size_pill}{mime_pill}{pages_pill}{title_pill}'
+                f'</div>'
+            )
+            st.markdown(header_html, unsafe_allow_html=True)
+            with st.expander("Preview text", expanded=False):
+                txt = st.session_state["texts"][fname]
                 st.text(txt[:2000] + ("..." if len(txt) > 2000 else ""))
 
 # ==============================
-# 2) INDEX (build & manage; multi-select; per-file delete; rebuild-all; stats)
+# 2) INDEX (build & manage; multi-select; per-file delete; stats)
 # ==============================
 with col_index:
     st.subheader("2) Build / Manage Index")

@@ -1,43 +1,27 @@
 # utils/pdf_loader.py
-import os
-from typing import List, Tuple
+from typing import Tuple, Optional, List
 import fitz  # PyMuPDF
 
-USE_OCR = os.getenv("USE_OCR", "false").lower() == "true"
 
-if USE_OCR:
-    from pdf2image import convert_from_path
-    import pytesseract
-
-def extract_text_from_pdf(file_path: str, min_text_len: int = 100) -> Tuple[str, bool]:
+def get_pdf_info(file_path: str) -> Tuple[int, Optional[str]]:
     """
-    Extract text from a PDF. Returns (text, used_ocr).
-    Tries fast native text first, then falls back to OCR if enabled.
+    Return (page_count, metadata_title_or_None).
+    Keeps it fast: doesn't read page text.
+    """
+    with fitz.open(file_path) as doc:
+        page_count = doc.page_count
+        title = (doc.metadata or {}).get("title") or None
+        return page_count, title
+
+
+def extract_text_from_pdf(file_path: str, max_pages: Optional[int] = None) -> str:
+    """
+    Extract text from a PDF with an optional page cap.
+    If max_pages is set, only the first `max_pages` pages are read.
     """
     parts: List[str] = []
-    used_ocr = False
-
-    # 1) Fast path: native text
-    try:
-        with fitz.open(file_path) as pdf:
-            for page in pdf:
-                parts.append(page.get_text())
-        text = "\n".join(parts).strip()
-        if len(text) >= min_text_len or not USE_OCR:
-            return text, False
-    except Exception:
-        # fall through to OCR if allowed
-        pass
-
-    # 2) OCR fallback
-    if USE_OCR:
-        images = convert_from_path(file_path)  # requires poppler
-        ocr_text = []
-        for img in images:
-            ocr_text.append(pytesseract.image_to_string(img))
-        text = "\n\n".join(ocr_text).strip()
-        used_ocr = True
-        return text, used_ocr
-
-    # No text and OCR disabled
-    return "", False
+    with fitz.open(file_path) as doc:
+        last = min(doc.page_count, max_pages) if max_pages else doc.page_count
+        for i in range(last):
+            parts.append(doc[i].get_text())
+    return "\n".join(parts)
