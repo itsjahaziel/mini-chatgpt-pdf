@@ -1,34 +1,39 @@
+# app.py
 import os
+import re
+import io
+import json
+import hashlib
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Optional
 
 import streamlit as st
+import requests
 from dotenv import load_dotenv
 
-from utils.pdf_loader import extract_text_from_pdf, get_pdf_info
+from utils.pdf_loader import extract_text_from_pdf
+from utils.doc_loader import extract_text_from_docx, extract_text_from_txt_md
 from utils.chunker import chunk_text
 from utils.embedder import get_or_create_collection, add_chunks
 from utils.llm import answer_with_context
-from utils.files import hashed_name, sniff_mime, too_big, ALLOWED_MIME, human_bytes
 
 # ---------- env / page ----------
 ROOT = Path(__file__).resolve().parent
-load_dotenv(ROOT / ".env")  # loads OPENAI_API_KEY, MAX_FILE_MB, MAX_PAGES
-
+load_dotenv(ROOT / ".env")
 st.set_page_config(page_title="Mini ChatGPT for PDFs", page_icon="📄", layout="wide")
-st.title("📄 Mini ChatGPT for PDFs")
+st.title("📄 Mini ChatGPT for PDFs (V2)")
 
-# ---------- simple styles ----------
+BACKEND_URL = os.getenv("BACKEND_URL", "").strip()
+
+# ---------- styles ----------
 st.markdown(
     """
     <style>
       .card { background:#fff; border:1px solid #E5E7EB; border-radius:12px; padding:16px; }
-      .pill { display:inline-block; padding:2px 10px; border-radius:999px; font-weight:600; font-size:12px; margin-right:6px; }
-      .pill-ok { background:#ECFDF5; color:#065F46; border:1px solid #A7F3D0; }
-      .pill-warn { background:#FEF3C7; color:#92400E; border:1px solid #FCD34D; }
-      .pill-info { background:#EFF6FF; color:#1E40AF; border:1px solid #BFDBFE; }
-      .file-header { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-      .file-name { font-weight:700; color:#0F172A; }
+      .muted { color:#6B7280; }
+      .tight { margin-top: .25rem; }
+      .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#ECFDF5; color:#065F46; font-weight:600; font-size:12px; }
+      .warnpill { display:inline-block; padding:2px 8px; border-radius:999px; background:#FEF3C7; color:#92400E; font-weight:600; font-size:12px; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -36,33 +41,43 @@ st.markdown(
 
 # ---------- state ----------
 if "texts" not in st.session_state:
-    st.session_state["texts"]: Dict[str, str] = {}          # filename -> extracted text
-if "indexed_sources" not in st.session_state:
-    st.session_state["indexed_sources"]: List[str] = []     # which filenames have embeddings
-if "file_meta" not in st.session_state:
-    # filename -> {'bytes': int, 'mime': str, 'pages_total': int, 'pages_used': int, 'title': Optional[str]}
-    st.session_state["file_meta"]: Dict[str, Dict[str, Any]] = {}
+    st.session_state["texts"]: Dict[str, str] = {}         # filename -> extracted text
+if "saved_names" not in st.session_state:
+    st.session_state["saved_names"]: List[str] = []        # filenames stored on disk (hashed)
+if "history" not in st.session_state:
+    st.session_state["history"]: List[Dict] = []           # Q&A history
 
 # ---------- helpers ----------
+def sanitize_filename(name: str) -> str:
+    base, ext = os.path.splitext(name)
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base).strip("_")
+    return f"{base}{ext or '.pdf'}"
+
+def hashed_name(original_name: str, data: bytes) -> str:
+    stem = Path(sanitize_filename(original_name)).stem
+    digest = hashlib.sha256(data).hexdigest()[:12]
+    ext = Path(original_name).suffix or ".pdf"
+    return f"{stem}__{digest}{ext}"
+
 def list_indexed_sources(collection) -> List[str]:
-    """Return unique 'source' values stored in Chroma metadatas (paginated & robust)."""
     sources = set()
     try:
-        offset, page = 0, 1000
+        offset = 0
+        page = 1000
         while True:
             batch = collection.get(include=["metadatas"], limit=page, offset=offset)
             metadatas = batch.get("metadatas") or []
             if not metadatas:
                 break
 
-            items = []
             if len(metadatas) and isinstance(metadatas[0], dict):
-                items = metadatas
+                it = metadatas
             else:
+                it = []
                 for rowlist in metadatas:
-                    items.extend(rowlist or [])
+                    it.extend(rowlist or [])
 
-            for md in items:
+            for md in it:
                 s = (md or {}).get("source")
                 if s:
                     sources.add(s)
@@ -75,26 +90,25 @@ def list_indexed_sources(collection) -> List[str]:
         pass
     return sorted(sources)
 
-
 def get_index_stats(collection) -> List[dict]:
-    """Return [{'source': name, 'chunks': count}, ...] with pagination."""
     counts: Dict[str, int] = {}
     try:
-        offset, page = 0, 1000
+        offset = 0
+        page = 1000
         while True:
             batch = collection.get(include=["metadatas"], limit=page, offset=offset)
             metadatas = batch.get("metadatas") or []
             if not metadatas:
                 break
 
-            items = []
             if len(metadatas) and isinstance(metadatas[0], dict):
-                items = metadatas
+                it = metadatas
             else:
+                it = []
                 for rowlist in metadatas:
-                    items.extend(rowlist or [])
+                    it.extend(rowlist or [])
 
-            for md in items:
+            for md in it:
                 s = (md or {}).get("source")
                 if s:
                     counts[s] = counts.get(s, 0) + 1
@@ -105,32 +119,41 @@ def get_index_stats(collection) -> List[dict]:
             offset += page
     except Exception:
         pass
-
     rows = [{"source": s, "chunks": n} for s, n in sorted(counts.items(), key=lambda x: x[0].lower())]
     return rows
 
-
-def index_files(collection, filenames: List[str], tokens_per_chunk: int, overlap: int) -> int:
-    """Index (or re-index) the given filenames using stable IDs; returns total chunks indexed."""
+def index_files_local(collection, filenames: List[str], tokens_per_chunk: int, overlap: int) -> int:
     total = 0
-    for fname in filenames:
-        text = st.session_state["texts"].get(fname, "")
-        if not text:
+    uploads_dir = ROOT / "data" / "uploads"
+    uploads_dir.mkdir(parents=True, exist_ok=True)
+
+    for saved in filenames:
+        path = uploads_dir / saved
+        if not path.exists():
             continue
+        ext = path.suffix.lower()
+
+        if ext == ".pdf":
+            text = extract_text_from_pdf(str(path))
+        elif ext == ".docx":
+            text = extract_text_from_docx(path.open("rb"))
+        else:
+            text = extract_text_from_txt_md(path.open("rb"))
+
+        if not text.strip():
+            continue
+
         chunks = chunk_text(text, tokens_per_chunk=tokens_per_chunk, overlap=overlap)
-        ids = [f"{fname}:{i}" for i in range(len(chunks))]  # stable per-file IDs
-        metas = [{"source": fname, "chunk_id": i} for i in range(len(chunks))]
+        ids = [f"{saved}:{i}" for i in range(len(chunks))]
+        metas = [{"source": saved, "chunk_id": i} for i in range(len(chunks))]
         try:
             add_chunks(collection, ids=ids, docs=chunks, metadatas=metas)
             total += len(chunks)
-            if fname not in st.session_state["indexed_sources"]:
-                st.session_state["indexed_sources"].append(fname)
         except Exception as e:
-            st.error(f"{fname}: indexing failed → {e}")
+            st.error(f"{saved}: indexing failed → {e}")
     return total
 
-
-# ---------- sidebar: knobs & index maintenance ----------
+# ---------- sidebar ----------
 st.sidebar.header("Settings")
 
 api_key = os.getenv("OPENAI_API_KEY", "")
@@ -139,18 +162,29 @@ if not api_key:
 else:
     st.sidebar.success("OpenAI API key detected.")
 
+if BACKEND_URL:
+    st.sidebar.success(f"Backend: {BACKEND_URL}")
+else:
+    st.sidebar.info("Backend not set. Running in direct mode.")
+
 tokens_per_chunk = st.sidebar.slider("Tokens per chunk", 300, 1500, 900, 50)
 overlap = st.sidebar.slider("Token overlap", 0, 300, 120, 10)
 top_k = st.sidebar.slider("Top-k chunks", 1, 8, 4, 1)
 model_name = st.sidebar.selectbox("LLM model", ["gpt-3.5-turbo"], index=0)
 
+# History export
+st.sidebar.markdown("---")
+if st.sidebar.button("⬇️ Export Q&A history (JSON)"):
+    data = json.dumps(st.session_state["history"], ensure_ascii=False, indent=2)
+    st.sidebar.download_button("Download history.json", data=data, file_name="history.json", mime="application/json")
+
+# Reset index
 st.sidebar.markdown("---")
 if st.sidebar.button("🧹 Reset ALL embeddings"):
     from shutil import rmtree
     try:
         rmtree("data/processed/chroma")
         st.sidebar.success("All embeddings deleted.")
-        st.session_state["indexed_sources"] = []
     except FileNotFoundError:
         st.sidebar.info("No index on disk.")
 
@@ -158,129 +192,87 @@ if st.sidebar.button("🧹 Reset ALL embeddings"):
 col_ingest, col_index = st.columns([2, 1], gap="large")
 
 # ==============================
-# 1) INGEST (safe upload + page-limit guard)
+# 1) INGEST (multi-file upload: PDF, DOCX, TXT, MD)
 # ==============================
 with col_ingest:
     st.subheader("1) Upload & Extract")
+    with st.container():
+        uploaded_files = st.file_uploader(
+            "Upload one or more documents",
+            type=["pdf", "docx", "txt", "md"],
+            accept_multiple_files=True,
+        )
+        if uploaded_files:
+            uploads_dir = ROOT / "data" / "uploads"
+            uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "5"))
-    MAX_PAGES = int(os.getenv("MAX_PAGES", "50"))
-    st.caption(
-        f"Max file size: {MAX_FILE_MB} MB • Max pages read: {MAX_PAGES} • "
-        f"Allowed types: {', '.join(sorted(ALLOWED_MIME))}"
-    )
+            for uf in uploaded_files:
+                data = uf.getvalue()
+                final_name = hashed_name(uf.name, data)
+                final_path = uploads_dir / final_name
 
-    uploaded_files = st.file_uploader(
-        "Upload one or more PDFs (text-based, not scans)",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
-
-    if uploaded_files:
-        uploads_dir = ROOT / "data" / "uploads"
-        uploads_dir.mkdir(parents=True, exist_ok=True)
-
-        for uf in uploaded_files:
-            data = uf.getvalue()
-
-            # size check
-            if too_big(len(data), MAX_FILE_MB):
-                st.warning(f"Skipped **{uf.name}**: over {MAX_FILE_MB} MB.")
-                continue
-
-            # MIME check
-            mime = sniff_mime(data)
-            if mime not in ALLOWED_MIME:
-                st.warning(f"Skipped **{uf.name}**: unsupported type `{mime}`.")
-                continue
-
-            final_name = hashed_name(uf.name, data, suffix=".pdf")
-            final_path = uploads_dir / final_name
-
-            if final_name in st.session_state["texts"]:
-                st.info(f"Duplicate upload skipped (already extracted): {final_name}")
-                continue
-
-            if not final_path.exists():
-                final_path.write_bytes(data)
-
-            try:
-                pages_total, title = get_pdf_info(str(final_path))
-            except Exception as e:
-                st.error(f"Failed to read metadata for {final_name}: {e}")
-                pages_total, title = 0, None
-
-            try:
-                # Page-limit guard: only read the first MAX_PAGES pages
-                text = extract_text_from_pdf(str(final_path), max_pages=MAX_PAGES)
-                if text and text.strip():
-                    st.session_state["texts"][final_name] = text
-                    st.session_state["file_meta"][final_name] = {
-                        "bytes": len(data),
-                        "mime": mime,
-                        "pages_total": pages_total,
-                        "pages_used": min(pages_total, MAX_PAGES),
-                        "title": title,
-                    }
-                    truncated = pages_total > MAX_PAGES
-                    msg = "Saved & Extracted"
-                    if truncated:
-                        msg += f" (truncated to first {MAX_PAGES} pages)"
-                    st.success(f"{msg}: {final_name}")
+                if BACKEND_URL:
+                    # Send to backend for validation + extraction
+                    try:
+                        resp = requests.post(
+                            f"{BACKEND_URL}/extract",
+                            files={"file": (uf.name, data, uf.type or "application/octet-stream")},
+                            timeout=60,
+                        )
+                        if resp.status_code != 200:
+                            st.error(f"{uf.name}: {resp.text}")
+                            continue
+                        js = resp.json()
+                        saved_as = js["saved_as"]
+                        st.session_state["saved_names"].append(saved_as)
+                        # Store preview text locally for preview UX
+                        st.session_state["texts"][saved_as] = js["text_preview"]
+                        st.success(f"Saved & extracted (via backend): {saved_as}")
+                    except Exception as e:
+                        st.error(f"Backend extract failed for {uf.name}: {e}")
                 else:
-                    st.warning(f"No text found in: {final_name} (likely a scanned PDF)")
-            except Exception as e:
-                st.error(f"Failed to extract {final_name}: {e}")
+                    # Direct mode
+                    if not final_path.exists():
+                        with open(final_path, "wb") as f:
+                            f.write(data)
 
-    # previews + meta badges
+                    ext = final_path.suffix.lower()
+                    try:
+                        if ext == ".pdf":
+                            text = extract_text_from_pdf(str(final_path))
+                        elif ext == ".docx":
+                            text = extract_text_from_docx(io.BytesIO(data))
+                        else:
+                            text = extract_text_from_txt_md(io.BytesIO(data))
+                        if text and text.strip():
+                            st.session_state["texts"][final_name] = text
+                            st.session_state["saved_names"].append(final_name)
+                            st.success(f"Saved & extracted: {final_name}")
+                        else:
+                            st.warning(f"No text found in: {final_name} (check if scanned PDF)")
+                    except Exception as e:
+                        st.error(f"Failed to extract {final_name}: {e}")
+
+    # Previews
     if st.session_state["texts"]:
-        st.markdown("**Extracted files**")
-        for fname in sorted(st.session_state["texts"].keys()):
-            meta = st.session_state["file_meta"].get(fname, {})
-            size_pill = f'<span class="pill pill-info">{human_bytes(meta.get("bytes", 0))}</span>' if meta else ""
-            mime_pill = f'<span class="pill pill-info">{meta.get("mime","?")}</span>' if meta else ""
-            pages_used = meta.get("pages_used")
-            pages_total = meta.get("pages_total")
-            if pages_used and pages_total:
-                pages_label = f"{pages_used}/{pages_total} pages" if pages_total >= pages_used else f"{pages_used} pages"
-            elif pages_total:
-                pages_label = f"{pages_total} pages"
-            else:
-                pages_label = "pages: ?"
-
-            truncated = (pages_total or 0) > pages_used if (pages_total and pages_used) else False
-            pages_pill = (
-                f'<span class="pill {"pill-warn" if truncated else "pill-ok"}">{pages_label}'
-                f'{" • truncated" if truncated else ""}</span>'
-            )
-
-            title = meta.get("title")
-            title_pill = f'<span class="pill pill-ok">title: {title}</span>' if title else ""
-
-            header_html = (
-                f'<div class="file-header">'
-                f'<span class="file-name">{fname}</span>'
-                f'{size_pill}{mime_pill}{pages_pill}{title_pill}'
-                f'</div>'
-            )
-            st.markdown(header_html, unsafe_allow_html=True)
-            with st.expander("Preview text", expanded=False):
-                txt = st.session_state["texts"][fname]
+        st.markdown("**Extracted files (preview)**")
+        for fname, txt in sorted(st.session_state["texts"].items()):
+            with st.expander(f"{fname} — preview", expanded=False):
                 st.text(txt[:2000] + ("..." if len(txt) > 2000 else ""))
 
 # ==============================
-# 2) INDEX (build & manage; multi-select; per-file delete; stats)
+# 2) INDEX (build/manage)
 # ==============================
 with col_index:
     st.subheader("2) Build / Manage Index")
     collection = get_or_create_collection("pdf_chunks")
 
-    extracted_names = sorted(st.session_state["texts"].keys())
+    saved_names = sorted(set(st.session_state["saved_names"]))
     to_index = st.multiselect(
         "Select files to (re)index",
-        options=extracted_names,
-        default=extracted_names,
-        help="You can re-index a file; IDs are stable, so duplicates are avoided.",
+        options=saved_names,
+        default=saved_names,
+        help="Stable per-file IDs avoid duplicate embeddings.",
     )
 
     c1, c2 = st.columns(2)
@@ -291,58 +283,92 @@ with col_index:
             elif not to_index:
                 st.info("Select at least one file.")
             else:
-                total = index_files(collection, to_index, tokens_per_chunk, overlap)
-                if total:
-                    st.success(f"Indexed/updated {total} chunks across {len(to_index)} file(s).")
+                if BACKEND_URL:
+                    try:
+                        resp = requests.post(
+                            f"{BACKEND_URL}/index",
+                            json={
+                                "saved_names": to_index,
+                                "tokens_per_chunk": tokens_per_chunk,
+                                "overlap": overlap,
+                            },
+                            timeout=300,
+                        )
+                        if resp.status_code != 200:
+                            st.error(f"Backend index failed: {resp.text}")
+                        else:
+                            js = resp.json()
+                            st.success(f"Indexed {js['total_chunks']} chunks across {js['indexed_files']} file(s).")
+                    except Exception as e:
+                        st.error(f"Backend index call failed: {e}")
+                else:
+                    total = index_files_local(collection, to_index, tokens_per_chunk, overlap)
+                    if total:
+                        st.success(f"Indexed/updated {total} chunks across {len(to_index)} file(s).")
+
     with c2:
-        if st.button("🔄 Rebuild index from ALL extracted files"):
+        if st.button("🔄 Rebuild index from ALL uploaded"):
             if not api_key:
                 st.error("Set OPENAI_API_KEY in .env.")
-            elif not extracted_names:
-                st.info("No extracted files yet.")
+            elif not saved_names:
+                st.info("No files uploaded yet.")
             else:
-                total = index_files(collection, extracted_names, tokens_per_chunk, overlap)
-                if total:
-                    st.success(f"Rebuilt/updated {total} chunks across {len(extracted_names)} file(s).")
+                if BACKEND_URL:
+                    try:
+                        resp = requests.post(
+                            f"{BACKEND_URL}/index",
+                            json={
+                                "saved_names": saved_names,
+                                "tokens_per_chunk": tokens_per_chunk,
+                                "overlap": overlap,
+                            },
+                            timeout=600,
+                        )
+                        if resp.status_code != 200:
+                            st.error(f"Backend rebuild failed: {resp.text}")
+                        else:
+                            js = resp.json()
+                            st.success(f"Rebuilt {js['total_chunks']} chunks across {js['indexed_files']} file(s).")
+                    except Exception as e:
+                        st.error(f"Backend rebuild call failed: {e}")
+                else:
+                    total = index_files_local(collection, saved_names, tokens_per_chunk, overlap)
+                    if total:
+                        st.success(f"Rebuilt/updated {total} chunks across {len(saved_names)} file(s).")
 
-    # per-source delete + stats
-    indexed_sources = list_indexed_sources(collection)
+    # Index summary
+    indexed_sources = []
+    try:
+        indexed_sources = list_indexed_sources(collection)
+    except Exception:
+        pass
+
     if indexed_sources:
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("**Indexed sources on disk**")
-        del_choice = st.selectbox("Delete embeddings for a file", ["—"] + indexed_sources)
-        if st.button("🗑️ Delete selected embeddings") and del_choice != "—":
-            try:
-                collection.delete(where={"source": del_choice})
-                st.success(f"Deleted embeddings for: {del_choice}")
-                if del_choice in st.session_state["indexed_sources"]:
-                    st.session_state["indexed_sources"].remove(del_choice)
-            except Exception as e:
-                st.error(f"Delete failed: {e}")
 
+        # stats table
         stats = get_index_stats(collection)
         if stats:
-            st.markdown("**Index summary**")
             st.table(stats)
+
         st.markdown("</div>", unsafe_allow_html=True)
     else:
         st.info("No indexed sources yet. Build the index after extracting.")
 
 # ==============================
-# 3) QUESTION ANSWERING
+# 3) QUESTION ANSWERING + History
 # ==============================
 st.markdown("---")
-st.subheader("3) Ask Questions (grounded in your PDFs)")
+st.subheader("3) Ask Questions (grounded in your docs)")
 
-indexed_sources = list_indexed_sources(collection)
+source_filter = []
 if indexed_sources:
     source_filter = st.multiselect(
         "Limit search to these files (optional)",
         options=indexed_sources,
         default=indexed_sources,
     )
-else:
-    source_filter = []
 
 question = st.text_input("Your question")
 go = st.button("🔎 Search & Answer")
@@ -353,38 +379,87 @@ if go:
     elif not api_key:
         st.error("Set OPENAI_API_KEY in .env.")
     else:
-        # metadata filter
-        where = None
-        if source_filter and len(source_filter) != len(indexed_sources):
-            where = {"source": {"$in": source_filter}}
-
-        try:
-            res = collection.query(
-                query_texts=[question],
-                n_results=top_k,
-                where=where,
-            )
-            docs = res.get("documents", [[]])[0]
-            metas = res.get("metadatas", [[]])[0]
-        except Exception as e:
-            st.error(f"Search failed: {e}")
-            docs, metas = [], []
-
-        if not docs:
-            st.warning("No relevant chunks found. Try a more specific question or adjust the source filter.")
-        else:
-            st.markdown("**Top matches**")
-            for i, (d, m) in enumerate(zip(docs, metas), start=1):
-                src = m.get("source", "?")
-                cid = m.get("chunk_id", "?")
-                with st.expander(f"[{i}] {src} · chunk {cid}", expanded=False):
-                    st.text(d[:1600] + ("..." if len(d) > 1600 else ""))
-
+        if BACKEND_URL:
             try:
-                answer = answer_with_context(question=question, context_docs=docs, model=model_name)
+                resp = requests.post(
+                    f"{BACKEND_URL}/query",
+                    json={
+                        "question": question,
+                        "top_k": top_k,
+                        "sources": source_filter if source_filter and len(source_filter) != 0 else None,
+                        "model": model_name,
+                    },
+                    timeout=120,
+                )
+                if resp.status_code != 200:
+                    st.error(f"Backend query failed: {resp.text}")
+                else:
+                    js = resp.json()
+                    matches = js.get("matches", [])
+                    if not matches:
+                        st.warning("No relevant chunks found.")
+                    else:
+                        st.markdown("**Top matches**")
+                        for i, m in enumerate(matches, start=1):
+                            with st.expander(f"[{i}] {m['source']} · chunk {m['chunk_id']}", expanded=False):
+                                st.text(m["text"])
+
+                    st.markdown("### Answer")
+                    st.write(js.get("answer", "I don’t know."))
+
+                    # Save to history
+                    st.session_state["history"].append(
+                        {"q": question, "answer": js.get("answer", ""), "sources": [m["source"] for m in matches]}
+                    )
             except Exception as e:
-                st.error(f"Answer failed: {e}")
+                st.error(f"Backend query call failed: {e}")
+        else:
+            # direct vector search
+            collection = get_or_create_collection("pdf_chunks")
+            where = None
+            if source_filter and len(source_filter) != 0 and len(source_filter) != len(indexed_sources):
+                where = {"source": {"$in": source_filter}}
+            try:
+                res = collection.query(query_texts=[question], n_results=top_k, where=where)
+                docs = res.get("documents", [[]])[0]
+                metas = res.get("metadatas", [[]])[0]
+            except Exception as e:
+                st.error(f"Search failed: {e}")
+                docs, metas = [], []
+
+            if not docs:
+                st.warning("No relevant chunks found.")
             else:
-                st.markdown("### Answer")
-                st.write(answer)
-                st.caption('If the answer is not in the context, the assistant will say "I don’t know."')
+                st.markdown("**Top matches**")
+                for i, (d, m) in enumerate(zip(docs, metas), start=1):
+                    src = m.get("source", "?")
+                    cid = m.get("chunk_id", "?")
+                    with st.expander(f"[{i}] {src} · chunk {cid}", expanded=False):
+                        st.text(d[:1600] + ("..." if len(d) > 1600 else ""))
+
+                try:
+                    answer = answer_with_context(question=question, context_docs=docs, model=model_name)
+                except Exception as e:
+                    st.error(f"Answer failed: {e}")
+                else:
+                    st.markdown("### Answer")
+                    st.write(answer)
+                    st.caption('If the answer is not in the context, the assistant will say "I don’t know."')
+                    st.session_state["history"].append(
+                        {"q": question, "answer": answer, "sources": [m.get("source") for m in metas]}
+                    )
+
+# ==============================
+# 4) HISTORY PANEL
+# ==============================
+st.markdown("---")
+st.subheader("History")
+if st.session_state["history"]:
+    for i, item in enumerate(st.session_state["history"], start=1):
+        with st.expander(f"Q{i}: {item['q']}", expanded=False):
+            st.markdown("**Answer**")
+            st.write(item["answer"])
+            if item.get("sources"):
+                st.caption("Sources: " + ", ".join(item["sources"]))
+else:
+    st.caption("No history yet. Ask something!")

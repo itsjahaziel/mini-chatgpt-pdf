@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pytest_cache
+.mypy_cache
+.venv
+env/
+venv/
+
+# Node/other
+node_modules/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Data
+data/processed/chroma/
+data/uploads/
+
+# Git
+.git
+.gitignore

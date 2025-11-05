@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: mini-pdf-backend
+    env_file:
+      - .env
+    environment:
+      # Ensure backend can read your key; BACKEND_URL is not needed here
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.ui
+    container_name: mini-pdf-ui
+    depends_on:
+      - backend
+    env_file:
+      - .env
+    environment:
+      # UI will call the backend via docker network name
+      - BACKEND_URL=${BACKEND_URL:-http://backend:8000}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
