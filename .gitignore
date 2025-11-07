@@ -7,3 +7,4 @@ data/uploads/
 data/processed/chroma/
 .DS_Store
 .streamlit/
+data/
